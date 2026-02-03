@@ -22,7 +22,7 @@ from lhotse.lazy import (
     count_newlines_fast,
 )
 from lhotse.serialization import extension_contains
-from lhotse.shar.readers.tar import TarIterator
+from lhotse.shar.readers.tar import TarIterator, InMemoryTarIterator
 from lhotse.utils import Pathlike, exactly_one_not_null, ifnone
 
 
@@ -259,12 +259,19 @@ class LazySharIterator(Dillable):
             }
 
             # Open every tarfile/jsonl so it's ready for streaming
+            # field_iters = {
+            #     field: TarIterator(path)
+            #     if extension_contains(".tar", path)
+            #     else _jsonl_tar_adaptor(LazyJsonlIterator(path), field=field)
+            #     for field, path in field_paths.items()
+            # }
             field_iters = {
-                field: TarIterator(path)
+                field: InMemoryTarIterator(path)
                 if extension_contains(".tar", path)
                 else _jsonl_tar_adaptor(LazyJsonlIterator(path), field=field)
                 for field, path in field_paths.items()
             }
+
 
             # *field_data contains all fields for a single cut (recording, features, array, etc.)
             yielded_cntr = 0

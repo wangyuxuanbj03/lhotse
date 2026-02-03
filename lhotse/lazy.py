@@ -269,19 +269,68 @@ class LazyJsonlIterator:
     """
     LazyJsonlIterator provides the ability to read JSON lines as Python dicts.
     It can also provide the number of lines via __len__ via fast newlines counting.
+
+    Note: For NFS environments with potential stale file handle issues, this class
+    attempts to minimize file handle lifetime by reading the entire file content
+    into memory first when possible, then processing line by line from memory.
     """
 
-    def __init__(self, path: Pathlike) -> None:
+    def __init__(self, path: Pathlike, use_in_memory: bool = True) -> None:
         self.path = path
         self._len = None
+        self.use_in_memory = use_in_memory
 
     def __iter__(self):
+        import time
+        max_retries = 3
+        retry_delay = 1.0
+
         tot = 0
-        with open_best(self.path, "r") as f:
-            for line in f:
+
+        if self.use_in_memory:
+            # Strategy 1: Load entire file into memory first (more robust for NFS)
+            # This minimizes file handle lifetime to just the read operation
+            for attempt in range(max_retries):
+                try:
+                    with open_best(self.path, "r") as f:
+                        lines = f.readlines()  # Read all lines at once
+                    # File handle closed immediately, no more NFS risk
+                    break
+                except OSError as e:
+                    if e.errno == 116 and attempt < max_retries - 1:  # Stale file handle
+                        time.sleep(retry_delay * (attempt + 1))
+                        continue
+                    raise
+
+            # Process lines from memory
+            for line in lines:
                 data = decode_json_line(line)
                 yield data
                 tot += 1
+        else:
+            # Strategy 2: Streaming read with retry on stale file handle
+            # Less memory intensive but more susceptible to NFS issues
+            lines_yielded = 0
+            for attempt in range(max_retries):
+                try:
+                    with open_best(self.path, "r") as f:
+                        # Skip lines we've already yielded
+                        for _ in range(lines_yielded):
+                            next(f)
+
+                        # Continue from where we left off
+                        for line in f:
+                            data = decode_json_line(line)
+                            yield data
+                            tot += 1
+                            lines_yielded += 1
+                    break  # Successfully completed iteration
+                except OSError as e:
+                    if e.errno == 116 and attempt < max_retries - 1:  # Stale file handle
+                        time.sleep(retry_delay * (attempt + 1))
+                        continue
+                    raise
+
         if self._len is None:
             self._len = tot
 
@@ -808,7 +857,10 @@ def count_newlines_fast(path: Pathlike):
     The fastest possible option in Python according to:
     https://stackoverflow.com/a/68385697/5285891
     (This is a slightly modified variant of that answer.)
+
+    Includes retry logic for NFS stale file handle errors.
     """
+    import time
 
     def _make_gen(reader):
         b = reader(2**16)
@@ -817,6 +869,17 @@ def count_newlines_fast(path: Pathlike):
             b = reader(2**16)
 
     read_mode = "rb" if not str(path) == "-" else "r"
-    with open_best(path, read_mode) as f:
-        count = sum(buf.count(b"\n") for buf in _make_gen(f.read))
-    return count
+
+    max_retries = 3
+    retry_delay = 1.0
+
+    for attempt in range(max_retries):
+        try:
+            with open_best(path, read_mode) as f:
+                count = sum(buf.count(b"\n") for buf in _make_gen(f.read))
+            return count
+        except OSError as e:
+            if e.errno == 116 and attempt < max_retries - 1:  # Stale file handle
+                time.sleep(retry_delay * (attempt + 1))
+                continue
+            raise

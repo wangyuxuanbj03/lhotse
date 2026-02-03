@@ -1,3 +1,4 @@
+import io
 import tarfile
 from pathlib import Path
 from typing import Generator, Optional, Tuple, Union
@@ -78,3 +79,110 @@ def parse_tarinfo(
         return None, path
     data = tar_file.extractfile(tarinfo).read()
     return data, path
+
+
+class InMemoryTarIterator:
+    """
+    In-memory variant of TarIterator that loads the entire tar file into memory before iterating.
+
+    This implementation solves NFS stale file handle issues by minimizing file handle lifetime:
+    - File is opened, read completely, and closed within seconds (not minutes)
+    - All subsequent processing happens from in-memory buffer
+    - No long-lived file handles that can become stale
+
+    **When to use this**:
+    - Multi-worker dataloading (num_workers > 0)
+    - Multi-node distributed training
+    - NFS or network filesystem storage
+    - When encountering "Stale file handle" errors
+
+    **Trade-offs**:
+    - Higher memory usage: ~shard_size per worker (e.g., 640MB - 2GB per worker)
+    - Initial loading delay: 2-5 seconds before first item
+    - Not suitable for extremely large tar files (> 5GB)
+
+    **Usage**:
+    Drop-in replacement for TarIterator - same interface, same output::
+
+        # Original
+        from lhotse.shar.readers.tar import TarIterator
+        tar_iter = TarIterator("/path/to/shard.tar")
+
+        # Replace with in-memory version
+        from lhotse.shar.readers.tar import InMemoryTarIterator
+        tar_iter = InMemoryTarIterator("/path/to/shard.tar")
+
+    Or modify LazySharIterator to use this implementation::
+
+        # In lhotse/shar/readers/lazy.py, replace:
+        from lhotse.shar.readers.tar import TarIterator
+        # with:
+        from lhotse.shar.readers.tar import InMemoryTarIterator as TarIterator
+
+    The interface is 100% compatible - no other code changes needed.
+    """
+
+    def __init__(self, source: Pathlike) -> None:
+        """
+        Initialize the iterator with a tar file path.
+
+        Args:
+            source: Path to the tar file (local path, NFS path, or URI)
+        """
+        self.source = source
+
+    def __iter__(
+        self,
+    ) -> Generator[Tuple[Optional[Manifest], Path], None, None]:
+        """
+        Iterate over tar file members, yielding (manifest, filename) tuples.
+
+        This method:
+        1. Quickly reads entire tar file into memory (seconds)
+        2. Closes the file handle immediately
+        3. Processes tar members from in-memory buffer
+        4. Yields items with identical format to TarIterator
+
+        Yields:
+            Tuple of (manifest, filename) where manifest is a Lhotse object
+            (Recording, Features, Array, etc.) with binary data attached,
+            and filename is the Path of the data file inside the tar archive.
+        """
+        # Step 1: Load entire tar file into memory
+        # File handle is only open during this read (2-5 seconds for typical shard)
+        import time
+        max_retries = 3
+        retry_delay = 1.0
+    
+        for attempt in range(max_retries):
+            try:
+                with open_best(self.source, mode="rb") as f:
+                    tar_bytes = f.read()
+                break  # 成功读取，退出重试循环
+            except OSError as e:
+                if e.errno == 116:  # Stale file handle
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay * (attempt + 1))
+                        continue
+                raise
+        
+        
+        
+        
+        # with open_best(self.source, mode="rb") as f:
+        #     tar_bytes = f.read()
+        # File handle is now closed - no risk of stale handle
+
+        # Step 2: Create tar file object from in-memory bytes
+        tar_fileobj = io.BytesIO(tar_bytes)
+
+        # Step 3: Process tar members from memory
+        # Use mode="r" instead of "r|*" - allows random access since entire file is available
+        with tarfile.open(fileobj=tar_fileobj, mode="r") as tar:
+            # Reuse existing pairwise iteration logic
+            for ((data, data_path), (meta, meta_path)) in iterate_tarfile_pairwise(tar):
+                if meta is not None:
+                    # Deserialize metadata and attach binary data
+                    meta = deserialize_item(decode_json_line(meta.decode("utf-8")))
+                    fill_shar_placeholder(manifest=meta, data=data, tarpath=data_path)
+                yield meta, data_path
